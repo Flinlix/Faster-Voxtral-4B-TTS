@@ -1,0 +1,24 @@
+[project]
+name = "Faster-Voxtral-4B-TTS"
+version = "1.0.0"
+description = "Streaming TTS server with <200ms time-to-first-audio and ~5GB VRAM. Wraps Mistral's Voxtral-4B-TTS-2603 model behind an OpenAI-compatible API."
+readme = "README.md"
+requires-python = ">=3.11"
+license = "CC-BY-NC-4.0"
+dependencies = [
+    "torch>=2.4",
+    "fastapi>=0.100",
+    "uvicorn>=0.20",
+    "pydantic>=2.0",
+    "numpy>=1.26",
+    "einops>=0.7",
+    "lameenc>=1.7",
+    "huggingface-hub>=0.20",
+    "safetensors>=0.4",
+    "mistral-inference>=1.6",
+    "mistral-common>=1.10",
+]
+
+[project.optional-dependencies]
+nf4 = ["bitsandbytes>=0.43"]
+int8 = ["torchao>=0.4"]
