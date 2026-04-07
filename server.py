@@ -191,7 +191,7 @@ async def _generate_and_stream_audio(
                 encoded = mp3_encoder.encode(data)
                 if encoded:
                     encoded_chunks += 1
-                    yield encoded
+                    yield bytes(encoded)
             else:
                 encoded_chunks += 1
                 yield data
@@ -200,7 +200,7 @@ async def _generate_and_stream_audio(
         if mp3_encoder:
             remaining = mp3_encoder.flush()
             if remaining:
-                yield remaining
+                yield bytes(remaining)
 
         if mp3_encoder and received_chunks > 0 and encoded_chunks == 0:
             logger.error("MP3 encoder produced no output after %d audio chunks", received_chunks)
