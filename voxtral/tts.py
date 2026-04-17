@@ -9,6 +9,7 @@ import contextlib
 import logging
 import time
 from collections.abc import Callable
+from pathlib import Path
 
 import numpy as np
 import torch
@@ -65,6 +66,7 @@ class VoxtralTTS:
         device: str = "cuda",
         dtype: torch.dtype = torch.bfloat16,
         quantize: str | None = "nf4",
+        custom_voice_dir: str | None = None,
     ):
         if config is None:
             config = VoxtralConfig.voxtral_4b()
@@ -109,6 +111,7 @@ class VoxtralTTS:
 
         self.voice_embeddings: dict[str, torch.Tensor] = {}
         self._load_voice_embeddings()
+        self._load_custom_voices(custom_voice_dir)
 
         self._audio_placeholder_token_id = (
             self.tokenizer.instruct_tokenizer.audio_encoder.special_ids.audio
@@ -179,6 +182,41 @@ class VoxtralTTS:
             )
         logger.info("Loaded %d voice embeddings: %s",
                     len(self.voice_embeddings), list(self.voice_embeddings.keys()))
+
+    def _load_custom_voices(self, voice_dir: str | None = None) -> None:
+        """Scan a directory for custom .pt voice embeddings and register them."""
+        if voice_dir is None:
+            return
+        voice_path = Path(voice_dir)
+        if not voice_path.exists():
+            logger.debug("Custom voice directory does not exist: %s", voice_path)
+            return
+        for pt_file in sorted(voice_path.glob("*.pt")):
+            name = pt_file.stem
+            try:
+                embedding = torch.load(str(pt_file), map_location="cpu", weights_only=True)
+                self.register_voice(name, embedding)
+            except Exception as exc:
+                logger.warning("Failed to load custom voice '%s': %s", name, exc)
+
+    def register_voice(self, name: str, embedding: torch.Tensor) -> None:
+        """Register a custom voice embedding for use with generate().
+
+        Args:
+            name: Voice name (used in ``generate(voice=name)``).
+            embedding: [N, 3072] voice embedding tensor.
+        """
+        if name in self.voice_embeddings:
+            logger.warning("Voice '%s' already exists, overwriting", name)
+        self.voice_embeddings[name] = embedding.to(
+            device=self.device, dtype=self.dtype
+        )
+        num_tokens = embedding.shape[0]
+        # Patch the tokenizer config so it knows how many audio tokens this voice needs
+        self.tokenizer.instruct_tokenizer.audio_encoder.audio_config.voice_num_audio_tokens[
+            name
+        ] = num_tokens
+        logger.info("Registered voice '%s' (%d tokens)", name, num_tokens)
 
     def _run_llm_with_precomputed_embeddings(
         self,

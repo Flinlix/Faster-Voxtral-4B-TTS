@@ -54,6 +54,7 @@ _orphaned_thread_count = [0]  # mutable counter for orphaned generation threads
 # Set by CLI before server boots
 _cli_device: str = "cuda"
 _cli_quantize: str | None = "nf4"
+_cli_voice_dir: str | None = None
 
 
 # ── Lifespan ────────────────────────────────────────────────────────────
@@ -63,7 +64,9 @@ _cli_quantize: str | None = "nf4"
 async def lifespan(app: FastAPI):
     _state.inference_lock = asyncio.Lock()
     logger.info("Loading model ...")
-    _state.tts_engine = VoxtralTTS(device=_cli_device, quantize=_cli_quantize)
+    _state.tts_engine = VoxtralTTS(
+        device=_cli_device, quantize=_cli_quantize, custom_voice_dir=_cli_voice_dir,
+    )
     logger.info("Warming up ...")
     _state.tts_engine.generate("warmup", max_frames=5, verbose=False)
     logger.info("Ready.")
@@ -90,6 +93,14 @@ app = FastAPI(title="Voxtral TTS", lifespan=lifespan)
 @app.get("/healthz")
 async def healthz() -> JSONResponse:
     return JSONResponse({"status": "ok"})
+
+
+@app.get("/v1/voices")
+async def list_voices() -> JSONResponse:
+    if _state.tts_engine is None:
+        return JSONResponse(status_code=503, content={"error": "not ready"})
+    voices = sorted(_state.tts_engine.voice_embeddings.keys())
+    return JSONResponse({"voices": voices})
 
 
 @app.get("/readyz")
@@ -319,7 +330,7 @@ async def create_speech(request: TTSRequest) -> StreamingResponse | JSONResponse
 
 
 def main():
-    global _cli_device, _cli_quantize
+    global _cli_device, _cli_quantize, _cli_voice_dir
     parser = argparse.ArgumentParser(description="Voxtral TTS - OpenAI-compatible API server")
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--host", default="0.0.0.0")
@@ -328,6 +339,10 @@ def main():
         "--quantize", choices=["nf4", "int8", "none"], default="nf4",
         help="LLM quantization: nf4 (default), int8, or none for full bf16",
     )
+    parser.add_argument(
+        "--voice-dir", default=None,
+        help="Directory containing custom .pt voice embeddings",
+    )
     args = parser.parse_args()
     logging.basicConfig(
         level=logging.INFO,
@@ -335,6 +350,7 @@ def main():
     )
     _cli_device = args.device
     _cli_quantize = None if args.quantize == "none" else args.quantize
+    _cli_voice_dir = args.voice_dir
     uvicorn.run(app, host=args.host, port=args.port)
 
 
