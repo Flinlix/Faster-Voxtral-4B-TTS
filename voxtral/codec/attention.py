@@ -4,7 +4,7 @@ import math
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
+from flash_attn import flash_attn_func
 
 from voxtral.nn import SwiGLU
 
@@ -70,41 +70,21 @@ class CodecAttention(nn.Module):
         if self.qk_norm:
             query, key = self.q_norm(query), self.k_norm(key)
 
+        # flash_attn expects [B, S, H, D]
         query = query.view(batch_size, seq_len, self.num_heads, self.head_dim)
         key = key.view(batch_size, seq_len, self.num_kv_heads, self.head_dim)
         value = value.view(batch_size, seq_len, self.num_kv_heads, self.head_dim)
 
-        # Expand KV heads for grouped-query attention
-        if self.kv_repeats > 1:
-            key = key.unsqueeze(3).expand(-1, -1, -1, self.kv_repeats, -1).flatten(2, 3)
-            value = value.unsqueeze(3).expand(-1, -1, -1, self.kv_repeats, -1).flatten(2, 3)
-
-        # [batch, heads, seq, dim]
-        query = query.transpose(1, 2)
-        key = key.transpose(1, 2)
-        value = value.transpose(1, 2)
-
-        # Build ALiBi + causal + sliding-window attention bias
-        positions = torch.arange(seq_len, device=features.device)
-        relative_positions = positions.unsqueeze(0) - positions.unsqueeze(1)  # [S, S]
-        slopes = self.alibi_slopes.to(dtype=features.dtype, device=features.device)
-        attention_bias = (
-            slopes.view(self.num_heads, 1, 1)
-            * relative_positions.unsqueeze(0).to(features.dtype)
-        )
-        if self.causal:
-            attention_bias = attention_bias.masked_fill(
-                relative_positions.unsqueeze(0) > 0, float("-inf"),
-            )
-        window_left = self.sliding_window
+        # flash_attn handles GQA natively when num_heads != num_kv_heads
         window_right = 0 if self.causal else self.sliding_window
-        outside_window = (relative_positions < -window_left) | (relative_positions > window_right)
-        attention_bias = attention_bias.masked_fill(outside_window.unsqueeze(0), float("-inf"))
-
-        output = F.scaled_dot_product_attention(
-            query, key, value, attn_mask=attention_bias.unsqueeze(0),
+        output = flash_attn_func(
+            query, key, value,
+            causal=self.causal,
+            window_size=(self.sliding_window, window_right),
+            alibi_slopes=self.alibi_slopes.to(dtype=torch.float32, device=features.device),
         )
-        output = output.transpose(1, 2).contiguous().view(batch_size, seq_len, -1)
+
+        output = output.contiguous().view(batch_size, seq_len, -1)
         output = self.wo(output)
         return output.squeeze(0) if features.dim() == 2 else output
 

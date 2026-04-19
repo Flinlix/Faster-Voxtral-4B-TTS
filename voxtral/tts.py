@@ -14,11 +14,13 @@ from pathlib import Path
 import numpy as np
 import torch
 import torch.nn as nn
+from flash_attn import flash_attn_with_kvcache
 from huggingface_hub import hf_hub_download
 from mistral_common.protocol.speech.request import SpeechRequest
 from mistral_common.tokens.tokenizers.mistral import MistralTokenizer
 from mistral_inference.args import TransformerArgs
 from mistral_inference.cache import BufferCache
+from mistral_inference.rope import apply_rotary_emb
 from mistral_inference.transformer import Transformer
 
 from voxtral.config import (
@@ -33,6 +35,8 @@ from voxtral.acoustic.flow_matching import FlowMatchingAudioTransformer
 from voxtral.codec.decoder import CodecDecoder
 from voxtral.embedding import AudioTokenEmbedding
 from voxtral.weights import load_checkpoint_weights
+
+MAX_CACHE_LEN = 4096  # max prompt + generation tokens for CUDA graph KV cache
 
 logger = logging.getLogger(__name__)
 
@@ -116,6 +120,9 @@ class VoxtralTTS:
         self._audio_placeholder_token_id = (
             self.tokenizer.instruct_tokenizer.audio_encoder.special_ids.audio
         )
+
+        if self.device.type == "cuda":
+            self._init_cuda_graphs()
 
     def _apply_quantization_and_move_to_device(self, quantize: str | None) -> None:
         """Quantize the LLM (if requested) and move all modules to device."""
@@ -218,6 +225,127 @@ class VoxtralTTS:
         ] = num_tokens
         logger.info("Registered voice '%s' (%d tokens)", name, num_tokens)
 
+    # ── CUDA Graph infrastructure ───────────────────────────────────────
+
+    def _init_cuda_graphs(self) -> None:
+        """Pre-allocate persistent buffers and capture CUDA graphs for decode."""
+        n_layers = self._llm_args.n_layers
+        n_kv_heads = self._llm_args.n_kv_heads
+        head_dim = self._llm_args.head_dim
+        dim = self._llm_args.dim
+
+        # Persistent KV cache shared between prefill (BufferCache) and decode (graph)
+        self._persistent_cache = BufferCache(
+            n_layers=n_layers,
+            max_batch_size=1,
+            max_seq_len=MAX_CACHE_LEN,
+            n_kv_heads=n_kv_heads,
+            head_dim=head_dim,
+        )
+        self._persistent_cache.to(device=self.device, dtype=self.dtype)
+
+        # Static tensors for CUDA graphs
+        self._graph_cache_seqlens = torch.zeros(1, device=self.device, dtype=torch.int32)
+        self._decode_input = torch.zeros(1, dim, device=self.device, dtype=self.dtype)
+        self._acoustic_input = torch.zeros(1, dim, device=self.device, dtype=self.dtype)
+
+        # torch.compile sub-modules for kernel fusion before graph capture
+        compile_opts = {"mode": "max-autotune-no-cudagraphs"}
+        for layer in self.llm.layers.values():
+            layer.feed_forward = torch.compile(layer.feed_forward, **compile_opts)
+            layer.attention_norm = torch.compile(layer.attention_norm, **compile_opts)
+            layer.ffn_norm = torch.compile(layer.ffn_norm, **compile_opts)
+        self.llm.norm = torch.compile(self.llm.norm, **compile_opts)
+        self.acoustic_transformer._predict_velocity = torch.compile(
+            self.acoustic_transformer._predict_velocity, **compile_opts
+        )
+
+        # Capture graphs
+        logger.info("Capturing CUDA graphs ...")
+        self._llm_decode_graph, self._decode_output = self._capture_llm_decode()
+        self._acoustic_graph, self._acoustic_output = self._capture_acoustic()
+        logger.info("CUDA graphs captured")
+
+    def _llm_decode_step(self) -> torch.Tensor:
+        """One LLM decode step using flash_attn_with_kvcache on static buffers."""
+        hidden = self._decode_input  # [1, D]
+        n_heads = self._llm_args.n_heads
+        n_kv_heads = self._llm_args.n_kv_heads
+        head_dim = self._llm_args.head_dim
+
+        freqs_cis = self.llm.freqs_cis[self._graph_cache_seqlens.long()]
+
+        for layer_id, layer in enumerate(self.llm.layers.values()):
+            normed = layer.attention_norm(hidden)
+
+            xq = layer.attention.wq(normed).view(1, n_heads, head_dim)
+            xk = layer.attention.wk(normed).view(1, n_kv_heads, head_dim)
+            xv = layer.attention.wv(normed).view(1, n_kv_heads, head_dim)
+
+            xq, xk = apply_rotary_emb(xq, xk, freqs_cis)
+
+            attn_out = flash_attn_with_kvcache(
+                xq.unsqueeze(0),
+                self._persistent_cache.cache_k[layer_id],
+                self._persistent_cache.cache_v[layer_id],
+                xk.unsqueeze(0), xv.unsqueeze(0),
+                cache_seqlens=self._graph_cache_seqlens,
+                causal=True,
+            )
+            attn_out = layer.attention.wo(attn_out.view(1, n_heads * head_dim))
+            hidden = hidden + attn_out
+
+            hidden = hidden + layer.feed_forward(layer.ffn_norm(hidden))
+
+        self._graph_cache_seqlens.add_(1)
+        return self.llm.norm(hidden)
+
+    def _capture_llm_decode(self) -> tuple[torch.cuda.CUDAGraph, torch.Tensor]:
+        """Capture LLM decode step as a CUDA graph."""
+        self._graph_cache_seqlens.fill_(100)
+
+        s = torch.cuda.Stream()
+        s.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(s):
+            for _ in range(3):
+                self._graph_cache_seqlens.fill_(100)
+                self._llm_decode_step()
+        torch.cuda.current_stream().wait_stream(s)
+
+        self._graph_cache_seqlens.fill_(100)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            output = self._llm_decode_step()
+        return graph, output
+
+    def _capture_acoustic(self) -> tuple[torch.cuda.CUDAGraph, torch.Tensor]:
+        """Capture acoustic transformer forward as a CUDA graph."""
+        s = torch.cuda.Stream()
+        s.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(s):
+            for _ in range(3):
+                self.acoustic_transformer(self._acoustic_input)
+        torch.cuda.current_stream().wait_stream(s)
+
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            output = self.acoustic_transformer(self._acoustic_input)
+        return graph, output
+
+    def _graphed_llm_decode(self, input_embedding: torch.Tensor) -> torch.Tensor:
+        """Run one LLM decode step via CUDA graph replay."""
+        self._decode_input.copy_(input_embedding)
+        self._llm_decode_graph.replay()
+        return self._decode_output
+
+    def _graphed_acoustic(self, llm_hidden_state: torch.Tensor) -> torch.Tensor:
+        """Run acoustic transformer forward via CUDA graph replay."""
+        self._acoustic_input.copy_(llm_hidden_state)
+        self._acoustic_graph.replay()
+        return self._acoustic_output
+
+    # ── LLM helpers ─────────────────────────────────────────────────────
+
     def _run_llm_with_precomputed_embeddings(
         self,
         input_embeddings: torch.Tensor,
@@ -286,17 +414,30 @@ class VoxtralTTS:
         input_embeddings[audio_token_mask] = voice_embedding
 
         # 3. Create KV cache and run prefill
-        cache = BufferCache(
-            n_layers=self._llm_args.n_layers,
-            max_batch_size=1,
-            max_seq_len=input_ids.shape[0] + max_frames + 16,
-            n_kv_heads=self._llm_args.n_kv_heads,
-            head_dim=self._llm_args.head_dim,
-        )
-        cache.to(device=self.device, dtype=self.dtype)
-        cache.reset()
-
+        use_graphs = self.device.type == "cuda"
         prefill_length = input_ids.shape[0]
+        total_seq_len = prefill_length + max_frames + 16
+
+        if use_graphs and total_seq_len <= MAX_CACHE_LEN:
+            self._persistent_cache.reset()
+            cache = self._persistent_cache
+        else:
+            if use_graphs:
+                logger.warning(
+                    "Sequence length %d exceeds MAX_CACHE_LEN %d, falling back to non-graphed decode",
+                    total_seq_len, MAX_CACHE_LEN,
+                )
+                use_graphs = False
+            cache = BufferCache(
+                n_layers=self._llm_args.n_layers,
+                max_batch_size=1,
+                max_seq_len=total_seq_len,
+                n_kv_heads=self._llm_args.n_kv_heads,
+                head_dim=self._llm_args.head_dim,
+            )
+            cache.to(device=self.device, dtype=self.dtype)
+            cache.reset()
+
         generation_start_time = time.perf_counter()
 
         hidden_state = self._run_llm_with_precomputed_embeddings(
@@ -304,13 +445,19 @@ class VoxtralTTS:
         )
         hidden_state = hidden_state[-1:]  # last token → [1, D]
 
+        if use_graphs:
+            self._graph_cache_seqlens.fill_(prefill_length)
+
         # 4. Autoregressive generation
         generated_audio_codes: list[torch.Tensor] = []
         num_streamed_frames = 0
         next_stream_frame = stream_after_n_frames if stream_callback else float("inf")
 
         for _ in range(max_frames):
-            audio_codes = self.acoustic_transformer(hidden_state)  # [1, 37]
+            if use_graphs:
+                audio_codes = self._graphed_acoustic(hidden_state)
+            else:
+                audio_codes = self.acoustic_transformer(hidden_state)  # [1, 37]
 
             if audio_codes[0, 0].item() == END_AUDIO_ID:
                 break
@@ -333,9 +480,12 @@ class VoxtralTTS:
             next_token_embedding = self.audio_token_embedding(codes_for_embedding)  # [1, 1, D]
             next_token_embedding = next_token_embedding.squeeze(0)  # [1, D]
 
-            hidden_state = self._run_llm_with_precomputed_embeddings(
-                next_token_embedding, sequence_lengths=[1], cache=cache,
-            )
+            if use_graphs:
+                hidden_state = self._graphed_llm_decode(next_token_embedding)
+            else:
+                hidden_state = self._run_llm_with_precomputed_embeddings(
+                    next_token_embedding, sequence_lengths=[1], cache=cache,
+                )
 
         generation_time = time.perf_counter() - generation_start_time
 

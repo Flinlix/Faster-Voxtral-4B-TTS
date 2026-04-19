@@ -70,7 +70,7 @@ class AcousticTransformerConfig:
     acoustic_levels: int = 21
     num_acoustic_codes: int = 36
 
-    num_ode_steps: int = 8
+    num_ode_steps: int = 7
     classifier_free_guidance_scale: float = 1.2
     initial_noise_scale: float = 1.0
 
