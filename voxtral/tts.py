@@ -71,12 +71,14 @@ class VoxtralTTS:
         dtype: torch.dtype = torch.bfloat16,
         quantize: str | None = "nf4",
         custom_voice_dir: str | None = None,
+        compile: bool = False,
     ):
         if config is None:
             config = VoxtralConfig.voxtral_4b()
         self.config = config
         self.device = torch.device(device)
         self.dtype = dtype
+        self._compile = compile
 
         logger.info("Loading tokenizer ...")
         self.tokenizer = MistralTokenizer.from_hf_hub(config.repo_id)
@@ -249,16 +251,17 @@ class VoxtralTTS:
         self._decode_input = torch.zeros(1, dim, device=self.device, dtype=self.dtype)
         self._acoustic_input = torch.zeros(1, dim, device=self.device, dtype=self.dtype)
 
-        # torch.compile sub-modules for kernel fusion before graph capture
-        compile_opts = {"mode": "max-autotune-no-cudagraphs"}
-        for layer in self.llm.layers.values():
-            layer.feed_forward = torch.compile(layer.feed_forward, **compile_opts)
-            layer.attention_norm = torch.compile(layer.attention_norm, **compile_opts)
-            layer.ffn_norm = torch.compile(layer.ffn_norm, **compile_opts)
-        self.llm.norm = torch.compile(self.llm.norm, **compile_opts)
-        self.acoustic_transformer._predict_velocity = torch.compile(
-            self.acoustic_transformer._predict_velocity, **compile_opts
-        )
+        # Optional torch.compile for kernel fusion before graph capture
+        if self._compile:
+            compile_opts = {"mode": "max-autotune-no-cudagraphs"}
+            for layer in self.llm.layers.values():
+                layer.feed_forward = torch.compile(layer.feed_forward, **compile_opts)
+                layer.attention_norm = torch.compile(layer.attention_norm, **compile_opts)
+                layer.ffn_norm = torch.compile(layer.ffn_norm, **compile_opts)
+            self.llm.norm = torch.compile(self.llm.norm, **compile_opts)
+            self.acoustic_transformer._predict_velocity = torch.compile(
+                self.acoustic_transformer._predict_velocity, **compile_opts
+            )
 
         # Capture graphs
         logger.info("Capturing CUDA graphs ...")

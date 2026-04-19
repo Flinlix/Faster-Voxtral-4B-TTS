@@ -55,6 +55,7 @@ _orphaned_thread_count = [0]  # mutable counter for orphaned generation threads
 _cli_device: str = "cuda"
 _cli_quantize: str | None = "nf4"
 _cli_voice_dir: str | None = None
+_cli_compile: bool = False
 
 
 # ── Lifespan ────────────────────────────────────────────────────────────
@@ -66,6 +67,7 @@ async def lifespan(app: FastAPI):
     logger.info("Loading model ...")
     _state.tts_engine = VoxtralTTS(
         device=_cli_device, quantize=_cli_quantize, custom_voice_dir=_cli_voice_dir,
+        compile=_cli_compile,
     )
     logger.info("Warming up ...")
     _state.tts_engine.generate("warmup", max_frames=5, verbose=False)
@@ -330,7 +332,7 @@ async def create_speech(request: TTSRequest) -> StreamingResponse | JSONResponse
 
 
 def main():
-    global _cli_device, _cli_quantize, _cli_voice_dir
+    global _cli_device, _cli_quantize, _cli_voice_dir, _cli_compile
     parser = argparse.ArgumentParser(description="Voxtral TTS - OpenAI-compatible API server")
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--host", default="0.0.0.0")
@@ -343,6 +345,10 @@ def main():
         "--voice-dir", default=None,
         help="Directory containing custom .pt voice embeddings",
     )
+    parser.add_argument(
+        "--compile", action="store_true",
+        help="Enable torch.compile for ~8%% faster inference (+4 GB VRAM)",
+    )
     args = parser.parse_args()
     logging.basicConfig(
         level=logging.INFO,
@@ -351,6 +357,7 @@ def main():
     _cli_device = args.device
     _cli_quantize = None if args.quantize == "none" else args.quantize
     _cli_voice_dir = args.voice_dir
+    _cli_compile = args.compile
     uvicorn.run(app, host=args.host, port=args.port)
 
 
