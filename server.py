@@ -21,7 +21,6 @@ from fastapi.responses import StreamingResponse, JSONResponse
 from pydantic import BaseModel
 
 from voxtral import VoxtralTTS
-from voxtral.config import SAMPLE_RATE
 
 logger = logging.getLogger(__name__)
 
@@ -101,7 +100,7 @@ async def healthz() -> JSONResponse:
 async def list_voices() -> JSONResponse:
     if _state.tts_engine is None:
         return JSONResponse(status_code=503, content={"error": "not ready"})
-    voices = sorted(_state.tts_engine.voice_embeddings.keys())
+    voices = _state.tts_engine.list_voices()
     return JSONResponse({"voices": voices})
 
 
@@ -122,7 +121,7 @@ MEDIA_TYPES = {
 }
 
 
-def _build_wav_header(sample_rate: int = SAMPLE_RATE, bits_per_sample: int = 16, channels: int = 1) -> bytes:
+def _build_wav_header(sample_rate: int, bits_per_sample: int = 16, channels: int = 1) -> bytes:
     """WAV header with max-size placeholder for streaming."""
     byte_rate = sample_rate * channels * bits_per_sample // 8
     block_align = channels * bits_per_sample // 8
@@ -149,27 +148,19 @@ async def _generate_and_stream_audio(
     loop = asyncio.get_running_loop()
     queue: asyncio.Queue[bytes | None] = asyncio.Queue(maxsize=64)
 
-    def on_audio_chunk(chunk: np.ndarray) -> None:
-        if client_disconnect_event.is_set():
-            raise RuntimeError("Client disconnected")
-        pcm_bytes = (chunk * 32767).clip(-32768, 32767).astype(np.int16).tobytes()
-        future = asyncio.run_coroutine_threadsafe(queue.put(pcm_bytes), loop)
-        future.result(timeout=30)  # block producer; timeout prevents deadlock on teardown
-
     generation_error: list[Exception | None] = [None]
 
     def generation_thread() -> None:
         try:
-            _state.tts_engine.generate(
-                text, voice=voice, max_frames=max_frames,
-                stream_callback=on_audio_chunk,
-            )
+            for chunk in _state.tts_engine.stream(text, voice=voice, max_frames=max_frames):
+                if client_disconnect_event.is_set():
+                    break
+                pcm_bytes = (chunk * 32767).clip(-32768, 32767).astype(np.int16).tobytes()
+                future = asyncio.run_coroutine_threadsafe(queue.put(pcm_bytes), loop)
+                future.result(timeout=30)  # block producer; timeout prevents deadlock on teardown
         except RuntimeError as exc:
-            if "Client disconnected" in str(exc):
-                logger.debug("Generation thread stopped: %s", exc)
-            else:
-                logger.error("Generation failed: %s", exc)
-                generation_error[0] = exc
+            logger.error("Generation failed: %s", exc)
+            generation_error[0] = exc
         except TimeoutError as exc:
             logger.debug("Generation thread stopped: %s", exc)
         finally:
@@ -178,16 +169,17 @@ async def _generate_and_stream_audio(
     # Set up encoder
     mp3_encoder = None
 
+    sample_rate = _state.tts_engine.sample_rate
     if output_format == "mp3":
         import lameenc
         mp3_encoder = lameenc.Encoder()
         mp3_encoder.set_bit_rate(128)
-        mp3_encoder.set_in_sample_rate(SAMPLE_RATE)
+        mp3_encoder.set_in_sample_rate(sample_rate)
         mp3_encoder.set_channels(1)
         mp3_encoder.set_quality(2)
         mp3_encoder.silence()
     elif output_format == "wav":
-        yield _build_wav_header()
+        yield _build_wav_header(sample_rate)
 
     thread = threading.Thread(target=generation_thread, daemon=True)
     thread.start()
@@ -256,10 +248,10 @@ async def create_speech(request: TTSRequest) -> StreamingResponse | JSONResponse
             },
         })
 
-    if request.model != "voxtral-4b":
+    if request.model != _state.tts_engine.model_name:
         return JSONResponse(status_code=400, content={
             "error": {
-                "message": f"Unknown model '{request.model}'. Only 'voxtral-4b' is available.",
+                "message": f"Unknown model '{request.model}'. Only '{_state.tts_engine.model_name}' is available.",
                 "type": "invalid_request_error",
             },
         })
@@ -294,8 +286,8 @@ async def create_speech(request: TTSRequest) -> StreamingResponse | JSONResponse
             },
         })
 
-    if voice not in _state.tts_engine.voice_embeddings:
-        available = ", ".join(sorted(_state.tts_engine.voice_embeddings.keys()))
+    if not _state.tts_engine.has_voice(voice):
+        available = ", ".join(_state.tts_engine.list_voices())
         return JSONResponse(status_code=400, content={
             "error": {
                 "message": f"Unknown voice '{voice}'. Available: {available}",

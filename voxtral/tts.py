@@ -8,7 +8,7 @@ and exposes a ``generate()`` method for inference.
 import contextlib
 import logging
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from pathlib import Path
 
 import numpy as np
@@ -54,6 +54,12 @@ VOICE_PRESETS = [
 class VoxtralTTS:
     """End-to-end Voxtral TTS pipeline.
 
+    Can be used directly as a Python library::
+
+        from voxtral import VoxtralTTS
+        tts = VoxtralTTS()
+        audio = tts.generate("Hello world", voice="neutral_female")
+
     Pipeline: Mistral-3B LLM → FlowMatching Acoustic Transformer → Voxtral Codec Decoder
 
     Args:
@@ -63,6 +69,8 @@ class VoxtralTTS:
         quantize: LLM quantization mode - ``"nf4"`` (default),
             ``"int8"``, or ``None`` for full bf16.
     """
+
+    model_name: str = "voxtral-4b"
 
     def __init__(
         self,
@@ -227,6 +235,21 @@ class VoxtralTTS:
         ] = num_tokens
         logger.info("Registered voice '%s' (%d tokens)", name, num_tokens)
 
+    # ── Public library API ──────────────────────────────────────────────
+
+    @property
+    def sample_rate(self) -> int:
+        """Audio sample rate in Hz."""
+        return SAMPLE_RATE
+
+    def list_voices(self) -> list[str]:
+        """Return sorted list of available voice names."""
+        return sorted(self.voice_embeddings.keys())
+
+    def has_voice(self, voice: str) -> bool:
+        """Return True if *voice* is loaded and available."""
+        return voice in self.voice_embeddings
+
     # ── CUDA Graph infrastructure ───────────────────────────────────────
 
     def _init_cuda_graphs(self) -> None:
@@ -374,6 +397,114 @@ class VoxtralTTS:
         cache.update_seqlens(sequence_lengths)
         return self.llm.norm(hidden_state)
 
+    def stream(
+        self,
+        text: str,
+        voice: str = "neutral_female",
+        max_frames: int = 2000,
+    ) -> Iterator[np.ndarray]:
+        """Synthesise text, yielding float32 PCM chunks (24 kHz, mono) as audio is generated.
+
+        Yields the first chunk after the very first audio frame is decoded, giving
+        minimal time-to-first-audio. Each chunk is approximately 80 ms of audio.
+
+        Args:
+            text: Input text to synthesise.
+            voice: Voice preset name or custom registered voice.
+            max_frames: Maximum audio frames to generate.
+
+        Yields:
+            Float32 numpy arrays of audio samples at 24 kHz.
+        """
+        with torch.inference_mode():
+            # 0. Validate voice
+            if not self.has_voice(voice):
+                available = ", ".join(self.list_voices())
+                raise ValueError(f"Unknown voice '{voice}'. Available: {available}")
+
+            # 1. Tokenize
+            request = SpeechRequest(input=text, voice=voice)
+            tokenized = self.tokenizer.encode_speech_request(request)
+            input_ids = torch.tensor(tokenized.tokens, dtype=torch.long, device=self.device)
+
+            # 2. Build input embeddings with voice embedding injection
+            voice_embedding = self.voice_embeddings[voice]
+            audio_token_mask = input_ids == self._audio_placeholder_token_id
+            input_embeddings = self.llm.tok_embeddings(input_ids)  # [seq_len, D]
+            input_embeddings[audio_token_mask] = voice_embedding
+
+            # 3. Create KV cache and run prefill
+            use_graphs = self.device.type == "cuda"
+            prefill_length = input_ids.shape[0]
+            total_seq_len = prefill_length + max_frames + 16
+
+            if use_graphs and total_seq_len <= MAX_CACHE_LEN:
+                self._persistent_cache.reset()
+                cache = self._persistent_cache
+            else:
+                if use_graphs:
+                    logger.warning(
+                        "Sequence length %d exceeds MAX_CACHE_LEN %d, falling back to non-graphed decode",
+                        total_seq_len, MAX_CACHE_LEN,
+                    )
+                    use_graphs = False
+                cache = BufferCache(
+                    n_layers=self._llm_args.n_layers,
+                    max_batch_size=1,
+                    max_seq_len=total_seq_len,
+                    n_kv_heads=self._llm_args.n_kv_heads,
+                    head_dim=self._llm_args.head_dim,
+                )
+                cache.to(device=self.device, dtype=self.dtype)
+                cache.reset()
+
+            hidden_state = self._run_llm_with_precomputed_embeddings(
+                input_embeddings, sequence_lengths=[prefill_length], cache=cache,
+            )
+            hidden_state = hidden_state[-1:]  # last token → [1, D]
+
+            if use_graphs:
+                self._graph_cache_seqlens.fill_(prefill_length)
+
+            # 4. Autoregressive generation — yield audio chunks as frames are decoded
+            generated_audio_codes: list[torch.Tensor] = []
+            num_yielded_frames = 0
+
+            for _ in range(max_frames):
+                if use_graphs:
+                    audio_codes = self._graphed_acoustic(hidden_state)
+                else:
+                    audio_codes = self.acoustic_transformer(hidden_state)  # [1, 37]
+
+                if audio_codes[0, 0].item() == END_AUDIO_ID:
+                    break
+
+                generated_audio_codes.append(audio_codes[0].cpu())
+
+                # Decode and yield new audio using windowed codec context
+                context_start = max(0, num_yielded_frames - CODEC_CONTEXT_FRAMES)
+                chunk_audio = self._decode_audio_codes_to_waveform(generated_audio_codes[context_start:])
+                skip_samples = (num_yielded_frames - context_start) * SAMPLES_PER_FRAME
+                new_audio = chunk_audio[skip_samples:]
+                if len(new_audio) > 0:
+                    yield new_audio
+                num_yielded_frames = len(generated_audio_codes)
+
+                # LLM decode for next step
+                codes_for_embedding = audio_codes.unsqueeze(-1)  # [1, 37, 1]
+                next_token_embedding = self.audio_token_embedding(codes_for_embedding)  # [1, 1, D]
+                next_token_embedding = next_token_embedding.squeeze(0)  # [1, D]
+
+                if use_graphs:
+                    hidden_state = self._graphed_llm_decode(next_token_embedding)
+                else:
+                    hidden_state = self._run_llm_with_precomputed_embeddings(
+                        next_token_embedding, sequence_lengths=[1], cache=cache,
+                    )
+
+            if not generated_audio_codes:
+                raise RuntimeError("No audio frames generated - the model produced no output for this input")
+
     @torch.inference_mode()
     def generate(
         self,
@@ -385,131 +516,40 @@ class VoxtralTTS:
         stream_interval_frames: int = 1,
         verbose: bool = True,
     ) -> np.ndarray:
-        """Generate audio waveform from text.
+        """Generate and return a complete audio waveform from text.
+
+        For real-time applications prefer ``stream()`` which yields chunks
+        as they are generated, giving minimal time-to-first-audio.
 
         Args:
             text: Input text to synthesise.
             voice: Voice preset name.
             max_frames: Maximum audio frames (at 12.5 Hz → 80 ms each).
-            stream_callback: Optional ``callback(audio_chunk_np)`` called with each
-                decoded audio chunk during generation.
-            stream_after_n_frames: Frames to generate before the first stream emission.
-            stream_interval_frames: Frames between subsequent decode-and-emit cycles.
-            verbose: Whether to print generation statistics.
+            stream_callback: Optional ``callback(chunk)`` called with each decoded chunk.
+            stream_after_n_frames: Kept for API compatibility; stream() always yields each frame.
+            stream_interval_frames: Kept for API compatibility; stream() always yields each frame.
+            verbose: Log generation speed statistics.
 
         Returns:
             Float32 numpy array of audio samples at 24 kHz.
         """
-        # 0. Validate voice
-        if voice not in self.voice_embeddings:
-            available = ", ".join(sorted(self.voice_embeddings.keys()))
-            raise ValueError(f"Unknown voice '{voice}'. Available: {available}")
-
-        # 1. Tokenize
-        request = SpeechRequest(input=text, voice=voice)
-        tokenized = self.tokenizer.encode_speech_request(request)
-        input_ids = torch.tensor(tokenized.tokens, dtype=torch.long, device=self.device)
-
-        # 2. Build input embeddings with voice embedding injection
-        voice_embedding = self.voice_embeddings[voice]
-        audio_token_mask = input_ids == self._audio_placeholder_token_id
-        input_embeddings = self.llm.tok_embeddings(input_ids)  # [seq_len, D]
-        input_embeddings[audio_token_mask] = voice_embedding
-
-        # 3. Create KV cache and run prefill
-        use_graphs = self.device.type == "cuda"
-        prefill_length = input_ids.shape[0]
-        total_seq_len = prefill_length + max_frames + 16
-
-        if use_graphs and total_seq_len <= MAX_CACHE_LEN:
-            self._persistent_cache.reset()
-            cache = self._persistent_cache
-        else:
-            if use_graphs:
-                logger.warning(
-                    "Sequence length %d exceeds MAX_CACHE_LEN %d, falling back to non-graphed decode",
-                    total_seq_len, MAX_CACHE_LEN,
-                )
-                use_graphs = False
-            cache = BufferCache(
-                n_layers=self._llm_args.n_layers,
-                max_batch_size=1,
-                max_seq_len=total_seq_len,
-                n_kv_heads=self._llm_args.n_kv_heads,
-                head_dim=self._llm_args.head_dim,
-            )
-            cache.to(device=self.device, dtype=self.dtype)
-            cache.reset()
-
         generation_start_time = time.perf_counter()
+        chunks: list[np.ndarray] = []
 
-        hidden_state = self._run_llm_with_precomputed_embeddings(
-            input_embeddings, sequence_lengths=[prefill_length], cache=cache,
-        )
-        hidden_state = hidden_state[-1:]  # last token → [1, D]
+        for chunk in self.stream(text, voice=voice, max_frames=max_frames):
+            chunks.append(chunk)
+            if stream_callback is not None:
+                stream_callback(chunk)
 
-        if use_graphs:
-            self._graph_cache_seqlens.fill_(prefill_length)
-
-        # 4. Autoregressive generation
-        generated_audio_codes: list[torch.Tensor] = []
-        num_streamed_frames = 0
-        next_stream_frame = stream_after_n_frames if stream_callback else float("inf")
-
-        for _ in range(max_frames):
-            if use_graphs:
-                audio_codes = self._graphed_acoustic(hidden_state)
-            else:
-                audio_codes = self.acoustic_transformer(hidden_state)  # [1, 37]
-
-            if audio_codes[0, 0].item() == END_AUDIO_ID:
-                break
-
-            generated_audio_codes.append(audio_codes[0].cpu())
-
-            # Streaming: decode new codes with bounded context window
-            if stream_callback and len(generated_audio_codes) >= next_stream_frame:
-                context_start = max(0, num_streamed_frames - CODEC_CONTEXT_FRAMES)
-                chunk_audio = self._decode_audio_codes_to_waveform(generated_audio_codes[context_start:])
-                skip_samples = (num_streamed_frames - context_start) * SAMPLES_PER_FRAME
-                new_audio = chunk_audio[skip_samples:]
-                if len(new_audio) > 0:
-                    stream_callback(new_audio)
-                num_streamed_frames = len(generated_audio_codes)
-                next_stream_frame = len(generated_audio_codes) + stream_interval_frames
-
-            # Convert codes to embedding for next LLM step
-            codes_for_embedding = audio_codes.unsqueeze(-1)  # [1, 37, 1]
-            next_token_embedding = self.audio_token_embedding(codes_for_embedding)  # [1, 1, D]
-            next_token_embedding = next_token_embedding.squeeze(0)  # [1, D]
-
-            if use_graphs:
-                hidden_state = self._graphed_llm_decode(next_token_embedding)
-            else:
-                hidden_state = self._run_llm_with_precomputed_embeddings(
-                    next_token_embedding, sequence_lengths=[1], cache=cache,
-                )
-
-        generation_time = time.perf_counter() - generation_start_time
-
-        if not generated_audio_codes:
+        if not chunks:
             raise RuntimeError("No audio frames generated - the model produced no output for this input")
 
-        # 5. Final decode of all generated codes
-        audio = self._decode_audio_codes_to_waveform(generated_audio_codes)
+        audio = np.concatenate(chunks)
+        generation_time = time.perf_counter() - generation_start_time
 
-        # Emit any remaining audio not yet streamed
-        if stream_callback and num_streamed_frames < len(generated_audio_codes):
-            context_start = max(0, num_streamed_frames - CODEC_CONTEXT_FRAMES)
-            chunk_audio = self._decode_audio_codes_to_waveform(generated_audio_codes[context_start:])
-            skip_samples = (num_streamed_frames - context_start) * SAMPLES_PER_FRAME
-            new_audio = chunk_audio[skip_samples:]
-            if len(new_audio) > 0:
-                stream_callback(new_audio)
-
-        num_frames = len(generated_audio_codes)
-        duration_seconds = len(audio) / SAMPLE_RATE
         if verbose:
+            num_frames = len(chunks)
+            duration_seconds = len(audio) / SAMPLE_RATE
             logger.info(
                 "%d frames (%.2fs audio) in %.2fs (%.1f frames/s, %.2fx realtime)",
                 num_frames, duration_seconds, generation_time,
