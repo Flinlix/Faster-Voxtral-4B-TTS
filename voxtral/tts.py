@@ -7,6 +7,7 @@ and exposes a ``generate()`` method for inference.
 
 import contextlib
 import logging
+import re
 import time
 from collections.abc import Callable, Iterator
 from pathlib import Path
@@ -397,6 +398,26 @@ class VoxtralTTS:
         cache.update_seqlens(sequence_lengths)
         return self.llm.norm(hidden_state)
 
+    # Whitelist: Latin + Latin Extended (covers DE/FR/ES/etc.), digits,
+    # whitespace, and punctuation a TTS model can meaningfully pronounce.
+    _TEXT_FILTER_RE = re.compile(
+        r'[^\u0020-\u007E'           # Basic Latin (ASCII printable)
+        r'\u00A1-\u024F'             # Latin-1 Supplement + Latin Extended A/B
+        r'\u2018\u2019\u201C\u201D'  # typographic quotes \u2018\u2019\u201C\u201D
+        r'\u2013\u2014'              # en-dash, em-dash
+        r'\u2026'                    # ellipsis
+        r']',
+        re.UNICODE,
+    )
+
+    @classmethod
+    def _clean_text(cls, text: str) -> str:
+        """Strip characters that cannot be meaningfully synthesised."""
+        text = text.replace("\n", " ").replace("\r", " ")
+        text = cls._TEXT_FILTER_RE.sub("", text)
+        text = re.sub(r'\s{2,}', ' ', text)
+        return text.strip()
+
     def stream(
         self,
         text: str,
@@ -417,7 +438,10 @@ class VoxtralTTS:
             Float32 numpy arrays of audio samples at 24 kHz.
         """
         with torch.inference_mode():
-            # 0. Validate voice
+            # 0. Sanitise input and validate voice
+            text = self._clean_text(text)
+            if not text:
+                return
             if not self.has_voice(voice):
                 available = ", ".join(self.list_voices())
                 raise ValueError(f"Unknown voice '{voice}'. Available: {available}")
