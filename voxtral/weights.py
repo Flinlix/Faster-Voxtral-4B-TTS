@@ -40,12 +40,18 @@ def _remap_checkpoint_key_to_llm_key(checkpoint_key: str) -> str | None:
     return None
 
 
+def get_checkpoint_path(repo_id: str = REPO_ID) -> str:
+    """Return the local filesystem path to consolidated.safetensors (downloading if needed)."""
+    return hf_hub_download(repo_id, "consolidated.safetensors")
+
+
 def load_checkpoint_weights(
     llm: Transformer,
     acoustic_transformer: FlowMatchingAudioTransformer,
     codec_decoder: CodecDecoder,
     audio_token_embedding: AudioTokenEmbedding,
     repo_id: str = REPO_ID,
+    device: str | torch.device = "cpu",
 ) -> None:
     """Load all weights from consolidated.safetensors into the four model components.
 
@@ -55,15 +61,17 @@ def load_checkpoint_weights(
         codec_decoder: ``CodecDecoder`` instance.
         audio_token_embedding: ``AudioTokenEmbedding`` instance.
         repo_id: HuggingFace repository ID for the checkpoint.
+        device: Device to read tensors directly to (avoids extra CPU copy when ``cuda``).
     """
-    safetensors_path = hf_hub_download(repo_id, "consolidated.safetensors")
+    safetensors_path = get_checkpoint_path(repo_id)
+    device_str = str(device) if isinstance(device, torch.device) else device
 
     llm_state_dict: dict[str, torch.Tensor] = {}
     acoustic_state_dict: dict[str, torch.Tensor] = {}
     codec_state_dict: dict[str, torch.Tensor] = {}
     audio_embedding_state_dict: dict[str, torch.Tensor] = {}
 
-    with safe_open(safetensors_path, framework="pt", device="cpu") as safetensors_file:
+    with safe_open(safetensors_path, framework="pt", device=device_str) as safetensors_file:
         for key in safetensors_file.keys():
             tensor = safetensors_file.get_tensor(key)
 

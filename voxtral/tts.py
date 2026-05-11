@@ -7,9 +7,12 @@ and exposes a ``generate()`` method for inference.
 
 import contextlib
 import logging
+import os
 import re
+import threading
 import time
 from collections.abc import Callable, Iterator
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import numpy as np
@@ -35,7 +38,7 @@ from voxtral.config import (
 from voxtral.acoustic.flow_matching import FlowMatchingAudioTransformer
 from voxtral.codec.decoder import CodecDecoder
 from voxtral.embedding import AudioTokenEmbedding
-from voxtral.weights import load_checkpoint_weights
+from voxtral.weights import get_checkpoint_path, load_checkpoint_weights
 
 MAX_CACHE_LEN = 4096  # max prompt + generation tokens for CUDA graph KV cache
 
@@ -81,6 +84,7 @@ class VoxtralTTS:
         quantize: str | None = "nf4",
         custom_voice_dir: str | None = None,
         compile: bool = False,
+        use_cache: bool = True,
     ):
         if config is None:
             config = VoxtralConfig.voxtral_4b()
@@ -88,11 +92,10 @@ class VoxtralTTS:
         self.device = torch.device(device)
         self.dtype = dtype
         self._compile = compile
+        self._use_cache = use_cache
+        self._graphs_ready = threading.Event()
+        self._graph_capture_error: BaseException | None = None
 
-        logger.info("Loading tokenizer ...")
-        self.tokenizer = MistralTokenizer.from_hf_hub(config.repo_id)
-
-        logger.info("Building modules ...")
         self._llm_args = TransformerArgs(
             dim=config.llm.model_dim,
             n_layers=config.llm.num_layers,
@@ -105,24 +108,74 @@ class VoxtralTTS:
             max_batch_size=1,
             rope_theta=config.llm.rope_theta,
         )
-        self.llm = Transformer(self._llm_args, pipeline_rank=0, num_pipeline_ranks=1)
-        self.acoustic_transformer = FlowMatchingAudioTransformer(config.acoustic)
-        self.codec_decoder = CodecDecoder(config.codec)
-        self.audio_token_embedding = AudioTokenEmbedding(
-            embedding_dim=config.llm.model_dim,
-            semantic_codebook_size=config.codec.semantic_codebook_size,
-            acoustic_codebook_size=config.codec.acoustic_codebook_size,
-            num_acoustic_codebooks=config.codec.num_acoustic_codebooks,
-        )
+
+        # On a cache hit, tokenizer.from_hf_hub (0.9 s) and CodecDecoder
+        # construction (0.6 s) are independent of torch.load (2.9 s for the
+        # 3.7 GB cache file). Run all three in parallel to hide the two
+        # shorter tasks behind the longer one.
+        _tokenizer_result: list = []
+        _codec_result: list = []
+        _cache_result: list = []
+
+        def _load_tokenizer():
+            _tokenizer_result.append(MistralTokenizer.from_hf_hub(config.repo_id))
+
+        def _build_codec():
+            _codec_result.append(CodecDecoder(config.codec))
+
+        cache_path = self._cache_path(quantize)
+        cache_exists = self._use_cache and cache_path.exists()
+
+        if cache_exists:
+            def _do_torch_load():
+                try:
+                    blob = torch.load(
+                        cache_path, map_location=self.device,
+                        weights_only=False, mmap=True,
+                    )
+                except TypeError:
+                    # mmap= unsupported on older torch builds
+                    blob = torch.load(cache_path, map_location=self.device, weights_only=False)
+                _cache_result.append(blob)
+
+            logger.info("Loading weights (cache) + tokenizer in parallel ...")
+            _threads = [
+                threading.Thread(target=_load_tokenizer, daemon=True),
+                threading.Thread(target=_build_codec, daemon=True),
+                threading.Thread(target=_do_torch_load, daemon=True),
+            ]
+        else:
+            logger.info("Loading tokenizer + building codec ...")
+            _threads = [
+                threading.Thread(target=_load_tokenizer, daemon=True),
+                threading.Thread(target=_build_codec, daemon=True),
+            ]
+
+        for _t in _threads: _t.start()
+        for _t in _threads: _t.join()
+
+        self.tokenizer = _tokenizer_result[0]
+        self.codec_decoder = _codec_result[0]
 
         logger.info("Loading weights ...")
-        load_checkpoint_weights(
-            self.llm, self.acoustic_transformer,
-            self.codec_decoder, self.audio_token_embedding,
-            config.repo_id,
-        )
-
-        self._apply_quantization_and_move_to_device(quantize)
+        if not self._try_load_from_cache(quantize, preloaded_blob=_cache_result[0] if _cache_result else None):
+            # Cold path: build the remaining modules, load weights, quantize.
+            logger.info("Building modules ...")
+            self.llm = Transformer(self._llm_args, pipeline_rank=0, num_pipeline_ranks=1)
+            self.acoustic_transformer = FlowMatchingAudioTransformer(config.acoustic)
+            self.audio_token_embedding = AudioTokenEmbedding(
+                embedding_dim=config.llm.model_dim,
+                semantic_codebook_size=config.codec.semantic_codebook_size,
+                acoustic_codebook_size=config.codec.acoustic_codebook_size,
+                num_acoustic_codebooks=config.codec.num_acoustic_codebooks,
+            )
+            load_checkpoint_weights(
+                self.llm, self.acoustic_transformer,
+                self.codec_decoder, self.audio_token_embedding,
+                config.repo_id,
+            )
+            self._apply_quantization_and_move_to_device(quantize)
+            self._save_to_cache(quantize)
 
         self.voice_embeddings: dict[str, torch.Tensor] = {}
         self._load_voice_embeddings()
@@ -133,7 +186,14 @@ class VoxtralTTS:
         )
 
         if self.device.type == "cuda":
-            self._init_cuda_graphs()
+            self._graph_thread = threading.Thread(
+                target=self._init_cuda_graphs_background,
+                name="voxtral-graph-capture",
+                daemon=True,
+            )
+            self._graph_thread.start()
+        else:
+            self._graphs_ready.set()
 
     def _apply_quantization_and_move_to_device(self, quantize: str | None) -> None:
         """Quantize the LLM (if requested) and move all modules to device."""
@@ -184,15 +244,20 @@ class VoxtralTTS:
         )
 
     def _load_voice_embeddings(self) -> None:
-        """Download and cache all available voice embedding presets."""
-        for voice_name in VOICE_PRESETS:
+        """Download and cache all available voice embedding presets in parallel."""
+        def _load_one(voice_name: str) -> tuple[str, torch.Tensor | None]:
             try:
                 path = hf_hub_download(self.config.repo_id, f"voice_embedding/{voice_name}.pt")
-                self.voice_embeddings[voice_name] = torch.load(
-                    path, map_location="cpu", weights_only=True,
-                ).to(device=self.device, dtype=self.dtype)
+                tensor = torch.load(path, map_location="cpu", weights_only=True)
+                return voice_name, tensor.to(device=self.device, dtype=self.dtype)
             except Exception as exc:
                 logger.warning("Failed to load voice '%s': %s", voice_name, exc)
+                return voice_name, None
+
+        with ThreadPoolExecutor(max_workers=min(8, len(VOICE_PRESETS))) as pool:
+            for voice_name, tensor in pool.map(_load_one, VOICE_PRESETS):
+                if tensor is not None:
+                    self.voice_embeddings[voice_name] = tensor
         if not self.voice_embeddings:
             raise RuntimeError(
                 "No voice embeddings loaded - cannot serve TTS requests. "
@@ -251,8 +316,135 @@ class VoxtralTTS:
         """Return True if *voice* is loaded and available."""
         return voice in self.voice_embeddings
 
-    # ── CUDA Graph infrastructure ───────────────────────────────────────
+    def wait_for_ready(self, timeout: float | None = None) -> None:
+        """Block until background CUDA graph capture has completed.
 
+        ``stream()`` and ``generate()`` call this automatically, but you can
+        invoke it explicitly to make sure the first synthesis has no startup
+        latency (e.g. right before serving the first request).
+
+        Raises:
+            TimeoutError: if *timeout* elapses before capture finishes.
+            RuntimeError: if graph capture failed in the background.
+        """
+        if not self._graphs_ready.wait(timeout=timeout):
+            raise TimeoutError("CUDA graph capture did not complete within timeout")
+        if self._graph_capture_error is not None:
+            raise RuntimeError("CUDA graph capture failed") from self._graph_capture_error
+
+    # ── Persistent quantized weight cache ────────────────────────────
+
+    def _cache_path(self, quantize: str | None) -> Path:
+        """Filesystem location of the persistent state-dict cache.
+
+        Filename axes (any change → different file): config repo, quantize
+        mode, dtype, device kind, torch & CUDA versions.
+        """
+        cache_dir = Path(os.environ.get(
+            "VOXTRAL_CACHE_DIR",
+            Path.home() / ".cache" / "voxtral",
+        ))
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        repo_slug = re.sub(r"[^A-Za-z0-9._-]+", "_", self.config.repo_id)
+        dtype_str = str(self.dtype).removeprefix("torch.")
+        cuda_ver = (torch.version.cuda or "none").replace(".", "")
+        torch_ver = torch.__version__.split("+")[0].replace(".", "")
+        stamp = f"{repo_slug}-{quantize or 'full'}-{dtype_str}-{self.device.type}-pt{torch_ver}-cu{cuda_ver}"
+        return cache_dir / f"voxtral-{stamp}.pt"
+
+    def _try_load_from_cache(self, quantize: str | None, preloaded_blob=None) -> bool:
+        """Try to restore quantized + device-resident modules from disk.
+
+        Returns True on success; False if the cache is missing, stale, or
+        invalid (caller must then run the full load + quantize path).
+
+        We pickle whole module objects rather than state_dicts because bnb's
+        ``Params4bit`` packs quantized weights into an opaque shape that
+        ``load_state_dict`` cannot reconstruct from a fresh ``LinearNF4``.
+        """
+        if not self._use_cache:
+            return False
+        cache_path = self._cache_path(quantize)
+        if not cache_path.exists():
+            return False
+        try:
+            source_mtime = Path(get_checkpoint_path(self.config.repo_id)).stat().st_mtime
+        except Exception:
+            source_mtime = None
+
+        if preloaded_blob is not None:
+            blob = preloaded_blob
+        else:
+            try:
+                try:
+                    blob = torch.load(
+                        cache_path, map_location=self.device,
+                        weights_only=False, mmap=True,
+                    )
+                except TypeError:
+                    blob = torch.load(cache_path, map_location=self.device, weights_only=False)
+            except Exception as exc:
+                logger.warning("Could not load weight cache (%s); regenerating", exc)
+                return False
+
+        if source_mtime is not None and blob.get("source_mtime") != source_mtime:
+            logger.info("Source weights changed since cache was written; regenerating")
+            return False
+
+        logger.info("Restoring weights from cache: %s", cache_path)
+        try:
+            self.llm = blob["llm"].eval()
+            self.acoustic_transformer = blob["acoustic"].eval()
+            self.audio_token_embedding = blob["embedding"].eval()
+            # codec uses torch.nn.utils.parametrize and can't be pickled, so
+            # we cache its state_dict and load it back into the freshly built module.
+            self.codec_decoder.load_state_dict(blob["codec"], strict=False)
+            self.codec_decoder.to(device=self.device, dtype=self.dtype).eval()
+        except Exception as exc:
+            logger.warning("Cache load failed (%s); regenerating", exc)
+            return False
+
+        # Invalidate cached semantic embedding (recomputed on first use).
+        self.codec_decoder.quantizer.semantic_codebook._embedding = None
+        return True
+
+    def _save_to_cache(self, quantize: str | None) -> None:
+        if not self._use_cache:
+            return
+        cache_path = self._cache_path(quantize)
+        try:
+            source_mtime = Path(get_checkpoint_path(self.config.repo_id)).stat().st_mtime
+        except Exception:
+            source_mtime = None
+        tmp_path = cache_path.with_suffix(cache_path.suffix + ".tmp")
+        try:
+            torch.save(
+                {
+                    "llm": self.llm,
+                    "acoustic": self.acoustic_transformer,
+                    "codec": self.codec_decoder.state_dict(),
+                    "embedding": self.audio_token_embedding,
+                    "source_mtime": source_mtime,
+                },
+                tmp_path,
+            )
+            tmp_path.replace(cache_path)
+            logger.info("Saved quantized weight cache: %s", cache_path)
+        except Exception as exc:
+            logger.warning("Could not save weight cache: %s", exc)
+            with contextlib.suppress(Exception):
+                tmp_path.unlink()
+
+    # ── CUDA Graph infrastructure ───────────────────────────────────────
+    def _init_cuda_graphs_background(self) -> None:
+        """Run graph capture in a background thread, signalling readiness."""
+        try:
+            self._init_cuda_graphs()
+        except BaseException as exc:  # noqa: BLE001 - propagate to wait_for_ready
+            self._graph_capture_error = exc
+            logger.exception("CUDA graph capture failed")
+        finally:
+            self._graphs_ready.set()
     def _init_cuda_graphs(self) -> None:
         """Pre-allocate persistent buffers and capture CUDA graphs for decode."""
         n_layers = self._llm_args.n_layers
@@ -334,9 +526,8 @@ class VoxtralTTS:
         s = torch.cuda.Stream()
         s.wait_stream(torch.cuda.current_stream())
         with torch.cuda.stream(s):
-            for _ in range(3):
-                self._graph_cache_seqlens.fill_(100)
-                self._llm_decode_step()
+            self._graph_cache_seqlens.fill_(100)
+            self._llm_decode_step()
         torch.cuda.current_stream().wait_stream(s)
 
         self._graph_cache_seqlens.fill_(100)
@@ -350,8 +541,7 @@ class VoxtralTTS:
         s = torch.cuda.Stream()
         s.wait_stream(torch.cuda.current_stream())
         with torch.cuda.stream(s):
-            for _ in range(3):
-                self.acoustic_transformer(self._acoustic_input)
+            self.acoustic_transformer(self._acoustic_input)
         torch.cuda.current_stream().wait_stream(s)
 
         graph = torch.cuda.CUDAGraph()
@@ -446,6 +636,12 @@ class VoxtralTTS:
                 available = ", ".join(self.list_voices())
                 raise ValueError(f"Unknown voice '{voice}'. Available: {available}")
 
+            # Wait for background CUDA graph capture to finish before deciding
+            # whether the graphed fast path is available.
+            use_graphs = self.device.type == "cuda"
+            if use_graphs:
+                self.wait_for_ready()
+
             # 1. Tokenize
             request = SpeechRequest(input=text, voice=voice)
             tokenized = self.tokenizer.encode_speech_request(request)
@@ -458,7 +654,6 @@ class VoxtralTTS:
             input_embeddings[audio_token_mask] = voice_embedding
 
             # 3. Create KV cache and run prefill
-            use_graphs = self.device.type == "cuda"
             prefill_length = input_ids.shape[0]
             total_seq_len = prefill_length + max_frames + 16
 

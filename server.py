@@ -55,6 +55,7 @@ _cli_device: str = "cuda"
 _cli_quantize: str | None = "nf4"
 _cli_voice_dir: str | None = None
 _cli_compile: bool = False
+_cli_use_cache: bool = True
 
 
 # ── Lifespan ────────────────────────────────────────────────────────────
@@ -62,15 +63,18 @@ _cli_compile: bool = False
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    import time as _time
+    _t0 = _time.time()
     _state.inference_lock = asyncio.Lock()
     logger.info("Loading model ...")
     _state.tts_engine = VoxtralTTS(
         device=_cli_device, quantize=_cli_quantize, custom_voice_dir=_cli_voice_dir,
-        compile=_cli_compile,
+        compile=_cli_compile, use_cache=_cli_use_cache,
     )
-    logger.info("Warming up ...")
-    _state.tts_engine.generate("warmup", max_frames=5, verbose=False)
-    logger.info("Ready.")
+    logger.info("VoxtralTTS.__init__ done: %.2fs", _time.time() - _t0)
+    logger.info("Waiting for CUDA graph capture ...")
+    _state.tts_engine.wait_for_ready()
+    logger.info("Ready. Total startup: %.2fs", _time.time() - _t0)
     yield
     # Graceful shutdown: free GPU memory
     logger.info("Shutting down - releasing model resources ...")
@@ -324,7 +328,7 @@ async def create_speech(request: TTSRequest) -> StreamingResponse | JSONResponse
 
 
 def main():
-    global _cli_device, _cli_quantize, _cli_voice_dir, _cli_compile
+    global _cli_device, _cli_quantize, _cli_voice_dir, _cli_compile, _cli_use_cache
     parser = argparse.ArgumentParser(description="Voxtral TTS - OpenAI-compatible API server")
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--host", default="0.0.0.0")
@@ -341,6 +345,10 @@ def main():
         "--compile", action="store_true",
         help="Enable torch.compile for ~8%% faster inference (+4 GB VRAM)",
     )
+    parser.add_argument(
+        "--no-cache", action="store_true",
+        help="Disable persistent quantized weight cache",
+    )
     args = parser.parse_args()
     logging.basicConfig(
         level=logging.INFO,
@@ -350,6 +358,7 @@ def main():
     _cli_quantize = None if args.quantize == "none" else args.quantize
     _cli_voice_dir = args.voice_dir
     _cli_compile = args.compile
+    _cli_use_cache = not args.no_cache
     uvicorn.run(app, host=args.host, port=args.port)
 
 
