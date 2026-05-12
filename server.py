@@ -35,6 +35,7 @@ class TTSRequest(BaseModel):
     response_format: str = "mp3"
     speed: float = 1.0
     stream_format: str | None = None
+    trailing_silence_ms: int | None = None  # None = use server default (--pause-ms)
 
 
 # ── Server state ────────────────────────────────────────────────────────
@@ -56,6 +57,7 @@ _cli_quantize: str | None = "nf4"
 _cli_voice_dir: str | None = None
 _cli_compile: bool = False
 _cli_use_cache: bool = True
+_cli_pause_ms: int = 0
 
 
 # ── Lifespan ────────────────────────────────────────────────────────────
@@ -147,6 +149,7 @@ async def _generate_and_stream_audio(
     max_frames: int,
     output_format: str,
     client_disconnect_event: threading.Event,
+    trailing_silence_ms: int = 0,
 ) -> AsyncGenerator[bytes, None]:
     """Run TTS in a background thread, yield encoded audio chunks via an async queue."""
     loop = asyncio.get_running_loop()
@@ -156,7 +159,10 @@ async def _generate_and_stream_audio(
 
     def generation_thread() -> None:
         try:
-            for chunk in _state.tts_engine.stream(text, voice=voice, max_frames=max_frames):
+            for chunk in _state.tts_engine.stream(
+                text, voice=voice, max_frames=max_frames,
+                trailing_silence_ms=trailing_silence_ms,
+            ):
                 if client_disconnect_event.is_set():
                     break
                 pcm_bytes = (chunk * 32767).clip(-32768, 32767).astype(np.int16).tobytes()
@@ -318,6 +324,8 @@ async def create_speech(request: TTSRequest) -> StreamingResponse | JSONResponse
         async with _state.inference_lock:
             async for chunk in _generate_and_stream_audio(
                 request.input, voice, 2000, output_format, client_disconnect_event,
+                trailing_silence_ms=request.trailing_silence_ms
+                    if request.trailing_silence_ms is not None else _cli_pause_ms,
             ):
                 yield chunk
 
@@ -328,7 +336,7 @@ async def create_speech(request: TTSRequest) -> StreamingResponse | JSONResponse
 
 
 def main():
-    global _cli_device, _cli_quantize, _cli_voice_dir, _cli_compile, _cli_use_cache
+    global _cli_device, _cli_quantize, _cli_voice_dir, _cli_compile, _cli_use_cache, _cli_pause_ms
     parser = argparse.ArgumentParser(description="Voxtral TTS - OpenAI-compatible API server")
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--host", default="0.0.0.0")
@@ -349,6 +357,10 @@ def main():
         "--no-cache", action="store_true",
         help="Disable persistent quantized weight cache",
     )
+    parser.add_argument(
+        "--pause-ms", type=int, default=0,
+        help="Milliseconds of silence appended after each synthesis response (default: 0)",
+    )
     args = parser.parse_args()
     logging.basicConfig(
         level=logging.INFO,
@@ -359,6 +371,7 @@ def main():
     _cli_voice_dir = args.voice_dir
     _cli_compile = args.compile
     _cli_use_cache = not args.no_cache
+    _cli_pause_ms = args.pause_ms
     uvicorn.run(app, host=args.host, port=args.port)
 
 

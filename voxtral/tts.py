@@ -613,6 +613,7 @@ class VoxtralTTS:
         text: str,
         voice: str = "neutral_female",
         max_frames: int = 2000,
+        trailing_silence_ms: int = 0,
     ) -> Iterator[np.ndarray]:
         """Synthesise text, yielding float32 PCM chunks (24 kHz, mono) as audio is generated.
 
@@ -623,6 +624,9 @@ class VoxtralTTS:
             text: Input text to synthesise.
             voice: Voice preset name or custom registered voice.
             max_frames: Maximum audio frames to generate.
+            trailing_silence_ms: Milliseconds of silence to append after the last
+                audio chunk. Useful for adding natural pauses between sentences
+                when calling ``stream()`` repeatedly in sequence.
 
         Yields:
             Float32 numpy arrays of audio samples at 24 kHz.
@@ -724,12 +728,17 @@ class VoxtralTTS:
             if not generated_audio_codes:
                 raise RuntimeError("No audio frames generated - the model produced no output for this input")
 
+        if trailing_silence_ms > 0:
+            silence_samples = int(SAMPLE_RATE * trailing_silence_ms / 1000)
+            yield np.zeros(silence_samples, dtype=np.float32)
+
     @torch.inference_mode()
     def generate(
         self,
         text: str,
         voice: str = "neutral_female",
         max_frames: int = 2000,
+        trailing_silence_ms: int = 0,
         stream_callback: Callable[[np.ndarray], None] | None = None,
         stream_after_n_frames: int = 1,
         stream_interval_frames: int = 1,
@@ -744,6 +753,7 @@ class VoxtralTTS:
             text: Input text to synthesise.
             voice: Voice preset name.
             max_frames: Maximum audio frames (at 12.5 Hz → 80 ms each).
+            trailing_silence_ms: Milliseconds of silence to append after synthesis.
             stream_callback: Optional ``callback(chunk)`` called with each decoded chunk.
             stream_after_n_frames: Kept for API compatibility; stream() always yields each frame.
             stream_interval_frames: Kept for API compatibility; stream() always yields each frame.
@@ -755,7 +765,8 @@ class VoxtralTTS:
         generation_start_time = time.perf_counter()
         chunks: list[np.ndarray] = []
 
-        for chunk in self.stream(text, voice=voice, max_frames=max_frames):
+        for chunk in self.stream(text, voice=voice, max_frames=max_frames,
+                                  trailing_silence_ms=trailing_silence_ms):
             chunks.append(chunk)
             if stream_callback is not None:
                 stream_callback(chunk)
