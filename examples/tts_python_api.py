@@ -69,7 +69,7 @@ HTML = """\
     <label>Voice:</label>
     <select id="voice"><option>neutral_female</option></select>
     <label>Intersentence Pause:</label>
-    <input type="range" id="pause-slider" min="0" max="1000" step="50" value="0">
+    <input type="range" id="pause-slider" min="0" max="1000" step="50" value="400">
     <span class="val" id="pause-val">0 ms</span>
   </div>
   <div class="row">
@@ -343,8 +343,8 @@ def main():
     parser.add_argument("--voice-dir", default=None)
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--quantize", default="nf4")
-    parser.add_argument("--pause-ms", type=int, default=0,
-                        help="Default trailing silence in ms (default: 0)")
+    parser.add_argument("--pause-ms", type=int, default=400,
+                        help="Default trailing silence in ms (default: 400)")
     parser.add_argument("--no-cache", action="store_true")
     parser.add_argument(
         "--no-sanitize-text", action="store_true",
@@ -373,7 +373,7 @@ def main():
 
 
 _tts = None
-_pause_ms: int = 0
+_pause_ms: int = 400
 _sanitize_text: bool = True
 
 if __name__ == "__main__":

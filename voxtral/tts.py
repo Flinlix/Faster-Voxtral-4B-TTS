@@ -665,7 +665,7 @@ class VoxtralTTS:
         text: str,
         voice: str = "neutral_female",
         max_frames: int = 2000,
-        trailing_silence_ms: int = 0,
+        trailing_silence_ms: int = 400,
         sanitize_text: bool = True,
     ) -> Iterator[np.ndarray]:
         """Synthesise text and yield audio chunks as they are generated.
@@ -807,7 +807,7 @@ class VoxtralTTS:
         text: str,
         voice: str = "neutral_female",
         max_frames: int = 2000,
-        trailing_silence_ms: int = 0,
+        trailing_silence_ms: int = 400,
         sanitize_text: bool = True,
         stream_callback: Callable[[np.ndarray], None] | None = None,
         verbose: bool = True,

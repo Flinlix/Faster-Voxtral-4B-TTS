@@ -68,7 +68,7 @@ _cli_quantize: str | None = "nf4"
 _cli_voice_dir: str | None = None
 _cli_compile: bool = False
 _cli_use_cache: bool = True
-_cli_pause_ms: int = 0
+_cli_pause_ms: int = 400
 _cli_sanitize_text: bool = True
 
 
@@ -160,7 +160,7 @@ async def _generate_and_stream_audio(
     max_frames: int,
     output_format: str,
     client_disconnect_event: threading.Event,
-    trailing_silence_ms: int = 0,
+    trailing_silence_ms: int = 400,
     sanitize_text: bool = True,
 ) -> AsyncGenerator[bytes, None]:
     """Run TTS in a background thread, yield encoded audio chunks via an async queue."""
@@ -394,8 +394,8 @@ def main():
         help="Disable persistent quantized weight cache",
     )
     parser.add_argument(
-        "--pause-ms", type=int, default=0,
-        help="Milliseconds of silence appended after each synthesis response (default: 0, max: 1000)",
+        "--pause-ms", type=int, default=400,
+        help="Milliseconds of silence appended after each synthesis response (default: 400, max: 1000)",
     )
     parser.add_argument(
         "--no-sanitize-text", action="store_true",

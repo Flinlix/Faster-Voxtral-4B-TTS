@@ -76,7 +76,7 @@ HTML = """\
     <label>Voice:</label>
     <select id="voice"><option>neutral_female</option></select>
     <label>Intersentence Pause:</label>
-    <input type="range" id="pause-slider" min="0" max="1000" step="50" value="0">
+    <input type="range" id="pause-slider" min="0" max="1000" step="50" value="400">
     <span class="val" id="pause-val">0 ms</span>
   </div>
   <div class="row">
@@ -398,8 +398,8 @@ def main():
     parser.add_argument("--host", default="0.0.0.0")
     parser.add_argument("--tts-url", default="http://localhost:8000",
                         help="Base URL of the running Voxtral server (default: http://localhost:8000)")
-    parser.add_argument("--pause-ms", type=int, default=0,
-                        help="Default trailing silence in ms sent per request (default: 0)")
+    parser.add_argument("--pause-ms", type=int, default=400,
+                        help="Default trailing silence in ms sent per request (default: 400)")
     args = parser.parse_args()
 
     _tts_url = args.tts_url.rstrip("/")
@@ -420,7 +420,7 @@ def main():
 
 
 _tts_url: str = ""
-_pause_ms: int = 0
+_pause_ms: int = 400
 
 if __name__ == "__main__":
     main()
