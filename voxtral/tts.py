@@ -58,20 +58,26 @@ VOICE_PRESETS = [
 class VoxtralTTS:
     """End-to-end Voxtral TTS pipeline.
 
-    Can be used directly as a Python library::
+    The pipeline runs LLM → flow-matching acoustic transformer → codec decoder
+    autoregressively, yielding 24 kHz mono audio.
 
-        from voxtral import VoxtralTTS
-        tts = VoxtralTTS()
-        audio = tts.generate("Hello world", voice="neutral_female")
-
-    Pipeline: Mistral-3B LLM → FlowMatching Acoustic Transformer → Voxtral Codec Decoder
+    Example:
+        >>> from voxtral import VoxtralTTS
+        >>> tts = VoxtralTTS()
+        >>> audio = tts.generate("Hello world", voice="neutral_female")
 
     Args:
-        config: Model configuration (defaults to Voxtral-4B).
-        device: Torch device string.
-        dtype: Floating-point dtype for model weights.
-        quantize: LLM quantization mode - ``"nf4"`` (default),
-            ``"int8"``, or ``None`` for full bf16.
+        config: Model configuration. Defaults to ``VoxtralConfig.voxtral_4b()``.
+        device: Torch device string (e.g. ``"cuda"``, ``"cuda:1"``, ``"cpu"``).
+        dtype: Floating-point dtype for non-quantized weights.
+        quantize: LLM quantization mode. One of ``"nf4"`` (default), ``"int8"``,
+            or ``None`` for full ``dtype`` precision.
+        custom_voice_dir: Optional directory of ``*.pt`` voice embeddings to
+            register at startup.
+        compile: If ``True``, apply ``torch.compile`` before CUDA graph capture
+            (~8% faster, +4 GB VRAM).
+        use_cache: If ``True``, persist quantized weights to disk and reuse
+            them on subsequent runs.
     """
 
     model_name: str = "voxtral-4b"
@@ -114,14 +120,23 @@ class VoxtralTTS:
         # 3.7 GB cache file). Run all three in parallel to hide the two
         # shorter tasks behind the longer one.
         _tokenizer_result: list = []
+        _tokenizer_exc: list[BaseException] = []
         _codec_result: list = []
+        _codec_exc: list[BaseException] = []
         _cache_result: list = []
+        _cache_exc: list[BaseException] = []
 
         def _load_tokenizer():
-            _tokenizer_result.append(MistralTokenizer.from_hf_hub(config.repo_id))
+            try:
+                _tokenizer_result.append(MistralTokenizer.from_hf_hub(config.repo_id))
+            except BaseException as exc:
+                _tokenizer_exc.append(exc)
 
         def _build_codec():
-            _codec_result.append(CodecDecoder(config.codec))
+            try:
+                _codec_result.append(CodecDecoder(config.codec))
+            except BaseException as exc:
+                _codec_exc.append(exc)
 
         cache_path = self._cache_path(quantize)
         cache_exists = self._use_cache and cache_path.exists()
@@ -129,14 +144,17 @@ class VoxtralTTS:
         if cache_exists:
             def _do_torch_load():
                 try:
-                    blob = torch.load(
-                        cache_path, map_location=self.device,
-                        weights_only=False, mmap=True,
-                    )
-                except TypeError:
-                    # mmap= unsupported on older torch builds
-                    blob = torch.load(cache_path, map_location=self.device, weights_only=False)
-                _cache_result.append(blob)
+                    try:
+                        blob = torch.load(
+                            cache_path, map_location=self.device,
+                            weights_only=False, mmap=True,
+                        )
+                    except TypeError:
+                        # mmap= unsupported on older torch builds
+                        blob = torch.load(cache_path, map_location=self.device, weights_only=False)
+                    _cache_result.append(blob)
+                except BaseException as exc:
+                    _cache_exc.append(exc)
 
             logger.info("Loading weights (cache) + tokenizer in parallel ...")
             _threads = [
@@ -153,6 +171,13 @@ class VoxtralTTS:
 
         for _t in _threads: _t.start()
         for _t in _threads: _t.join()
+
+        if _tokenizer_exc:
+            raise RuntimeError("Tokenizer initialization failed") from _tokenizer_exc[0]
+        if _codec_exc:
+            raise RuntimeError("Codec initialization failed") from _codec_exc[0]
+        if _cache_exc:
+            raise RuntimeError("Weight cache load failed") from _cache_exc[0]
 
         self.tokenizer = _tokenizer_result[0]
         self.codec_decoder = _codec_result[0]
@@ -283,14 +308,29 @@ class VoxtralTTS:
                 logger.warning("Failed to load custom voice '%s': %s", name, exc)
 
     def register_voice(self, name: str, embedding: torch.Tensor) -> None:
-        """Register a custom voice embedding for use with generate().
+        """Register a custom voice embedding for use with ``generate()``.
 
         Args:
-            name: Voice name (used in ``generate(voice=name)``).
-            embedding: [N, 3072] voice embedding tensor.
+            name: Voice name (passed as ``voice=name`` to ``generate``/``stream``).
+            embedding: 2-D tensor of shape ``[N, model_dim]`` (``model_dim`` is
+                3072 for Voxtral-4B).
+
+        Raises:
+            ValueError: If ``embedding`` is not 2-D or has the wrong width.
         """
         if name in self.voice_embeddings:
             logger.warning("Voice '%s' already exists, overwriting", name)
+        expected_width = self.config.llm.model_dim
+        if embedding.ndim != 2:
+            raise ValueError(
+                f"Voice embedding '{name}' must be a 2-D tensor [N, {expected_width}], "
+                f"got shape {tuple(embedding.shape)}"
+            )
+        if embedding.shape[1] != expected_width:
+            raise ValueError(
+                f"Voice embedding '{name}' has width {embedding.shape[1]}, "
+                f"expected {expected_width}"
+            )
         self.voice_embeddings[name] = embedding.to(
             device=self.device, dtype=self.dtype
         )
@@ -361,6 +401,10 @@ class VoxtralTTS:
         We pickle whole module objects rather than state_dicts because bnb's
         ``Params4bit`` packs quantized weights into an opaque shape that
         ``load_state_dict`` cannot reconstruct from a fresh ``LinearNF4``.
+
+        Security: ``weights_only=False`` deserialises arbitrary Python objects via
+        pickle. Only load caches from trusted paths (files written by this process).
+        Never point ``VOXTRAL_CACHE_DIR`` at a world-writable or untrusted location.
         """
         if not self._use_cache:
             return False
@@ -521,8 +565,6 @@ class VoxtralTTS:
 
     def _capture_llm_decode(self) -> tuple[torch.cuda.CUDAGraph, torch.Tensor]:
         """Capture LLM decode step as a CUDA graph."""
-        self._graph_cache_seqlens.fill_(100)
-
         s = torch.cuda.Stream()
         s.wait_stream(torch.cuda.current_stream())
         with torch.cuda.stream(s):
@@ -601,10 +643,20 @@ class VoxtralTTS:
     )
 
     @classmethod
-    def _clean_text(cls, text: str) -> str:
-        """Strip characters that cannot be meaningfully synthesised."""
+    def _clean_text(cls, text: str, *, sanitize: bool = True) -> str:
+        """Normalise whitespace and optionally strip non-Latin characters.
+
+        Args:
+            text: Raw input text.
+            sanitize: If ``True``, drop characters outside the Latin/typographic
+                whitelist.
+
+        Returns:
+            Cleaned text with collapsed whitespace and trimmed ends.
+        """
         text = text.replace("\n", " ").replace("\r", " ")
-        text = cls._TEXT_FILTER_RE.sub("", text)
+        if sanitize:
+            text = cls._TEXT_FILTER_RE.sub("", text)
         text = re.sub(r'\s{2,}', ' ', text)
         return text.strip()
 
@@ -614,27 +666,44 @@ class VoxtralTTS:
         voice: str = "neutral_female",
         max_frames: int = 2000,
         trailing_silence_ms: int = 0,
+        sanitize_text: bool = True,
     ) -> Iterator[np.ndarray]:
-        """Synthesise text, yielding float32 PCM chunks (24 kHz, mono) as audio is generated.
+        """Synthesise text and yield audio chunks as they are generated.
 
-        Yields the first chunk after the very first audio frame is decoded, giving
+        The first chunk is yielded after the very first frame is decoded, giving
         minimal time-to-first-audio. Each chunk is approximately 80 ms of audio.
 
         Args:
             text: Input text to synthesise.
-            voice: Voice preset name or custom registered voice.
-            max_frames: Maximum audio frames to generate.
-            trailing_silence_ms: Milliseconds of silence to append after the last
-                audio chunk. Useful for adding natural pauses between sentences
-                when calling ``stream()`` repeatedly in sequence.
+            voice: Voice preset name or a previously registered custom voice.
+            max_frames: Hard cap on generated audio frames (12.5 Hz, ~80 ms each).
+            trailing_silence_ms: Milliseconds of silence to append after the
+                last audio chunk. Clamped to ``[0, 1000]``. Useful for adding
+                natural pauses between sentences when calling ``stream()``
+                repeatedly in sequence.
+            sanitize_text: If ``True``, strip non-Latin characters before
+                synthesis. Set to ``False`` for Arabic, Hindi, or other
+                non-Latin scripts.
 
         Yields:
-            Float32 numpy arrays of audio samples at 24 kHz.
+            ``np.ndarray`` of ``float32`` audio samples in ``[-1, 1]`` at
+            24 kHz, mono.
+
+        Raises:
+            ValueError: If ``voice`` is unknown, or if ``text`` is empty after
+                sanitization (and ``sanitize_text`` was ``True``).
+            RuntimeError: If the model produces no output frames.
         """
         with torch.inference_mode():
-            # 0. Sanitise input and validate voice
-            text = self._clean_text(text)
+            # 0. Normalise whitespace, cap silence, and optionally filter characters
+            trailing_silence_ms = min(max(trailing_silence_ms, 0), 1000)
+            text = self._clean_text(text, sanitize=sanitize_text)
             if not text:
+                if sanitize_text:
+                    raise ValueError(
+                        "Text is empty after sanitization. "
+                        "Use sanitize_text=False to synthesise Arabic, Hindi, or other non-Latin scripts."
+                    )
                 return
             if not self.has_voice(voice):
                 available = ", ".join(self.list_voices())
@@ -739,9 +808,8 @@ class VoxtralTTS:
         voice: str = "neutral_female",
         max_frames: int = 2000,
         trailing_silence_ms: int = 0,
+        sanitize_text: bool = True,
         stream_callback: Callable[[np.ndarray], None] | None = None,
-        stream_after_n_frames: int = 1,
-        stream_interval_frames: int = 1,
         verbose: bool = True,
     ) -> np.ndarray:
         """Generate and return a complete audio waveform from text.
@@ -751,22 +819,30 @@ class VoxtralTTS:
 
         Args:
             text: Input text to synthesise.
-            voice: Voice preset name.
-            max_frames: Maximum audio frames (at 12.5 Hz → 80 ms each).
-            trailing_silence_ms: Milliseconds of silence to append after synthesis.
-            stream_callback: Optional ``callback(chunk)`` called with each decoded chunk.
-            stream_after_n_frames: Kept for API compatibility; stream() always yields each frame.
-            stream_interval_frames: Kept for API compatibility; stream() always yields each frame.
-            verbose: Log generation speed statistics.
+            voice: Voice preset name or registered custom voice.
+            max_frames: Hard cap on generated audio frames (12.5 Hz, ~80 ms each).
+            trailing_silence_ms: Milliseconds of silence appended after
+                synthesis. Clamped to ``[0, 1000]``.
+            sanitize_text: If ``True``, strip non-Latin characters before
+                synthesis. Set to ``False`` for non-Latin scripts.
+            stream_callback: Optional callback invoked with each decoded chunk.
+            verbose: If ``True``, log generation speed statistics.
 
         Returns:
-            Float32 numpy array of audio samples at 24 kHz.
+            ``np.ndarray`` of ``float32`` audio samples in ``[-1, 1]`` at
+            24 kHz, mono.
+
+        Raises:
+            ValueError: If ``voice`` is unknown, or if ``text`` is empty after
+                sanitization (and ``sanitize_text`` was ``True``).
+            RuntimeError: If the model produces no output frames.
         """
         generation_start_time = time.perf_counter()
         chunks: list[np.ndarray] = []
 
         for chunk in self.stream(text, voice=voice, max_frames=max_frames,
-                                  trailing_silence_ms=trailing_silence_ms):
+                                  trailing_silence_ms=trailing_silence_ms,
+                                  sanitize_text=sanitize_text):
             chunks.append(chunk)
             if stream_callback is not None:
                 stream_callback(chunk)
@@ -778,7 +854,8 @@ class VoxtralTTS:
         generation_time = time.perf_counter() - generation_start_time
 
         if verbose:
-            num_frames = len(chunks)
+            # Exclude the trailing-silence chunk (if any) from the frame count.
+            num_frames = len(chunks) - (1 if trailing_silence_ms > 0 else 0)
             duration_seconds = len(audio) / SAMPLE_RATE
             logger.info(
                 "%d frames (%.2fs audio) in %.2fs (%.1f frames/s, %.2fx realtime)",

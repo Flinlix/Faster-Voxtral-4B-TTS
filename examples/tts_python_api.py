@@ -1,4 +1,4 @@
-#!/home/felix/miniconda3/envs/voxtral/bin/python3
+#!/usr/bin/env python3
 """Minimal TTS demo — Python API, web UI with streaming audio.
 
 Serves a single-page UI at http://localhost:8080.
@@ -269,7 +269,7 @@ class Handler(BaseHTTPRequestHandler):
         global _pause_ms
         length = int(self.headers.get("Content-Length", 0))
         body = json.loads(self.rfile.read(length))
-        _pause_ms = max(0, min(int(body.get("pause_ms", _pause_ms)), 5000))
+        _pause_ms = max(0, min(int(body.get("pause_ms", _pause_ms)), 1000))
         data = json.dumps({"pause_ms": _pause_ms}).encode()
         self.send_response(200)
         self.send_header("Content-Type", "application/json")
@@ -281,7 +281,8 @@ class Handler(BaseHTTPRequestHandler):
         length = int(self.headers.get("Content-Length", 0))
         body = json.loads(self.rfile.read(length))
         text = body.get("text", "").strip()
-        voice = body.get("voice", "neutral_female").strip()
+        raw_voice = body.get("voice", None)
+        voice = (raw_voice.strip() if isinstance(raw_voice, str) else None) or "neutral_female"
 
         if not text:
             self.send_error(400, "No text")
@@ -307,7 +308,7 @@ class Handler(BaseHTTPRequestHandler):
                     if cancel.is_set():
                         break
                     pause = _pause_ms if _SENTENCE_END_RE.search(sentence) else 0
-                    for chunk in _tts.stream(sentence, voice=voice, trailing_silence_ms=pause):
+                    for chunk in _tts.stream(sentence, voice=voice, trailing_silence_ms=pause, sanitize_text=_sanitize_text):
                         if cancel.is_set():
                             break
                         pcm = (chunk * 32767).clip(-32768, 32767).astype(np.int16).tobytes()
@@ -334,7 +335,7 @@ class Handler(BaseHTTPRequestHandler):
 
 
 def main():
-    global _tts, _pause_ms
+    global _tts, _pause_ms, _sanitize_text
 
     parser = argparse.ArgumentParser(description="Voxtral TTS web demo — Python API")
     parser.add_argument("--port", type=int, default=8080)
@@ -345,9 +346,14 @@ def main():
     parser.add_argument("--pause-ms", type=int, default=0,
                         help="Default trailing silence in ms (default: 0)")
     parser.add_argument("--no-cache", action="store_true")
+    parser.add_argument(
+        "--no-sanitize-text", action="store_true",
+        help="Disable Latin-only character filter to support Arabic, Hindi, and other non-Latin scripts",
+    )
     args = parser.parse_args()
 
     _pause_ms = args.pause_ms
+    _sanitize_text = not args.no_sanitize_text
 
     from voxtral import VoxtralTTS
 
@@ -368,6 +374,7 @@ def main():
 
 _tts = None
 _pause_ms: int = 0
+_sanitize_text: bool = True
 
 if __name__ == "__main__":
     main()

@@ -13,7 +13,7 @@ OpenAI-compatible text-to-speech server powered by [Voxtral 4B](https://huggingf
 
 ## Requirements
 
-- Python ≥ 3.11
+- Python 3.12 recommended (3.11–3.13 supported)
 - NVIDIA GPU with ≥ 5 GB VRAM (NF4 quantization)
 
 | Quantization | Approx. VRAM |
@@ -29,8 +29,8 @@ In a personal blind listening test, no perceptible quality difference was found 
 **Requirements:** `git`, NVIDIA GPU with CUDA 12.6 driver.
 
 ```bash
-git clone https://github.com/your-repo/faster-voxtral-tts
-cd faster-voxtral-tts
+git clone <REPO_URL>
+cd <repo-dir>
 ./install.sh
 ```
 
@@ -72,15 +72,20 @@ curl -s http://localhost:8000/v1/audio/speech \
 ## CLI reference
 
 ```
-python server.py [OPTIONS]
+voxtral-server [OPTIONS]
 ```
 
-| Flag          | Default   | Description                                       |
-|---------------|-----------|---------------------------------------------------|
-| `--device`    | `cuda`    | Torch device (`cuda`, `cuda:1`, `cpu`)            |
-| `--host`      | `0.0.0.0` | Server bind address                               |
-| `--port`      | `8000`    | Server port                                       |
-| `--quantize`  | `nf4`     | LLM quantization: `nf4`, `int8`, or `none` (BF16) |
+| Flag                 | Default   | Description                                                        |
+|----------------------|-----------|-----------------------------------------------------------------|
+| `--device`           | `cuda`    | Torch device (`cuda`, `cuda:1`, `cpu`)                            |
+| `--host`             | `0.0.0.0` | Server bind address                                               |
+| `--port`             | `8000`    | Server port                                                       |
+| `--quantize`         | `nf4`     | LLM quantization: `nf4`, `int8`, or `none` (BF16)                |
+| `--voice-dir`        | *(none)*  | Directory of custom `.pt` voice embeddings to load at startup     |
+| `--pause-ms`         | `0`       | Milliseconds of silence appended after each response (max: 1000)  |
+| `--compile`          | off       | Enable `torch.compile` for ~8% faster inference (+4 GB VRAM)      |
+| `--no-cache`         | off       | Disable persistent quantized weight cache                         |
+| `--no-sanitize-text` | off       | Disable Latin-script filter — required for Arabic, Hindi, etc.    |
 
 ## API reference
 
@@ -90,14 +95,16 @@ Generate speech from text. Returns a streaming audio response.
 
 **Request body**
 
-| Field             | Type             | Default         | Description                                    |
-|-------------------|------------------|-----------------|------------------------------------------------|
-| `input`           | `string`         | *(required)*    | Text to synthesize (max 4096 characters)       |
-| `model`           | `string`         | `"voxtral-4b"`  | Model identifier (only `voxtral-4b` supported) |
-| `voice`           | `string \| dict` | `"neutral_female"`   | Voice preset name or `{"id": "voice_name"}`    |
-| `response_format` | `string`         | `"mp3"`         | `mp3`, `wav`, `pcm`                             |
-| `speed`           | `float`          | `1.0`           | Speech speed (only `1.0` supported)            |
-| `stream_format`   | `string \| null` | `null`          | Streaming mode (only `"audio"` supported)      |
+| Field                | Type             | Default           | Description                                                              |
+|----------------------|------------------|-------------------|--------------------------------------------------------------------------|
+| `input`              | `string`         | *(required)*      | Text to synthesize (max 4096 characters)                                 |
+| `model`              | `string`         | `"voxtral-4b"`    | Model identifier (only `voxtral-4b` supported)                           |
+| `voice`              | `string \| dict` | `"neutral_female"` | Voice preset name or `{"id": "voice_name"}`                             |
+| `response_format`    | `string`         | `"mp3"`           | `mp3`, `wav`, `pcm`                                                       |
+| `speed`              | `float`          | `1.0`             | Speech speed (only `1.0` supported)                                      |
+| `stream_format`      | `string \| null` | `null`            | Streaming mode (only `"audio"` supported)                                |
+| `trailing_silence_ms`| `integer \| null`| `null`            | Milliseconds of silence appended after synthesis (0–1000; null = server default) |
+| `sanitize_text`      | `boolean \| null`| `null`            | `false` required for Arabic, Hindi, and other non-Latin scripts (null = server default) |
 
 **Response** - Streaming audio bytes with the appropriate `Content-Type`.
 
@@ -123,18 +130,20 @@ Readiness probe. Returns `200` when the model is loaded, `503` while loading.
 | Arabic     | `ar_male`                                |
 | Hindi      | `hi_male`, `hi_female`                   |
 
+> **Non-Latin scripts (Arabic, Hindi):** The server applies a Latin-script character filter by default to protect against unsupported input. Disable it per-request with `"sanitize_text": false`, or globally for the server process with `--no-sanitize-text`.
+
 ## Architecture
 
 ```
 Text ──► Mistral 3B LLM ──► FlowMatching Acoustic Transformer ──► Codec Decoder ──► 24 kHz Waveform
               │                        │                                │
          26 layers               3 layers, Euler ODE            4-stage cascaded
-         3072-dim                 8 steps + CFG                 ALiBi attention
+         3072-dim                 7 steps + CFG                 ALiBi attention
 ```
 
 The pipeline runs autoregressively - the LLM emits one acoustic frame embedding
 per step, which the flow-matching transformer converts to codec tokens via an
-8-step ODE with classifier-free guidance. The codec decoder then synthesizes the
+7-step ODE with classifier-free guidance. The codec decoder then synthesizes the
 waveform in streaming chunks.
 
 ## Acknowledgements

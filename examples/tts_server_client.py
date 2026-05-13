@@ -274,7 +274,7 @@ class Handler(BaseHTTPRequestHandler):
         global _pause_ms
         length = int(self.headers.get("Content-Length", 0))
         body = json.loads(self.rfile.read(length))
-        _pause_ms = max(0, min(int(body.get("pause_ms", _pause_ms)), 5000))
+        _pause_ms = max(0, min(int(body.get("pause_ms", _pause_ms)), 1000))
         data = json.dumps({"pause_ms": _pause_ms}).encode()
         self.send_response(200)
         self.send_header("Content-Type", "application/json")
@@ -299,7 +299,8 @@ class Handler(BaseHTTPRequestHandler):
         length = int(self.headers.get("Content-Length", 0))
         body = json.loads(self.rfile.read(length))
         text = body.get("text", "").strip()
-        voice = body.get("voice", "neutral_female").strip()
+        raw_voice = body.get("voice", None)
+        voice = (raw_voice.strip() if isinstance(raw_voice, str) else None) or "neutral_female"
 
         if not text:
             self.send_error(400, "No text")
