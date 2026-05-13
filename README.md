@@ -26,18 +26,22 @@ In a personal blind listening test, no perceptible quality difference was found 
 
 ## Installation
 
+**Requirements:** `git`, NVIDIA GPU with CUDA 12.6 driver.
+
 ```bash
-# Create a virtual environment and install
-uv venv --python 3.13 && source .venv/bin/activate
+git clone https://github.com/your-repo/faster-voxtral-tts
+cd faster-voxtral-tts
+./install.sh
+```
 
-# For NF4 quantization (recommended, default)
-uv pip install -e ".[nf4]"
+That's it. The script installs [uv](https://docs.astral.sh/uv/) if needed, creates `.venv/`, installs PyTorch from the CUDA 12.6 index, builds `flash-attn`, and installs the package.
 
-# For full precision (BF16)
-uv pip install -e .
+**Quantization variants:**
 
-# For INT8 quantization
-uv pip install -e ".[int8]"
+```bash
+./install.sh          # NF4 — recommended (~5 GB VRAM)
+./install.sh --int8   # INT8 (~6 GB VRAM)
+./install.sh --bf16   # BF16 full precision (~9 GB VRAM)
 ```
 
 Model weights are downloaded automatically from Hugging Face on first launch.
@@ -45,7 +49,14 @@ Model weights are downloaded automatically from Hugging Face on first launch.
 ## Quick start
 
 ```bash
-python server.py
+source .venv/bin/activate
+voxtral-server
+```
+
+Or without activating the environment:
+
+```bash
+.venv/bin/voxtral-server
 ```
 
 ```bash
