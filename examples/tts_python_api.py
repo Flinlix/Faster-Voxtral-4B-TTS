@@ -219,7 +219,7 @@ async function synthesise() {
 }
 
 document.getElementById('text').addEventListener('keydown', e => {
-  if (e.key === 'Enter' && e.ctrlKey) synthesise();
+  if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); synthesise(); }
 });
 </script>
 </body>
